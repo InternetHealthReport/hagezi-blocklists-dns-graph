@@ -420,13 +420,31 @@ class IterativeResolver:
         self._in_flight[key] = future
         token = self._resolving_chain.set(chain | {key})
         try:
-            values, _, _, _ = await self._resolve_iterative(qname, rdtype)
-        except RecursionError:
-            values = []
+            # Protect the full iterative walk with a timeout so a bug or
+            # unexpected hang in the lower-level code doesn't leave callers
+            # awaiting an in-flight future forever. We pick a conservative
+            # timeout based on the per-query timeout/retries and a small
+            # multiplier for referral walks.
+            total_timeout = max(10.0, QUERY_TIMEOUT * (QUERY_RETRIES + 1) * 5)
+            try:
+                values, _, _, _ = await asyncio.wait_for(
+                    self._resolve_iterative(qname, rdtype), timeout=total_timeout
+                )
+            except asyncio.TimeoutError:
+                values = []
+            except RecursionError:
+                values = []
+        except Exception as exc:
+            # Ensure we propagate unexpected exceptions to any other
+            # coroutines that were awaiting the same in-flight future:
+            if not future.done():
+                future.set_exception(exc)
+            raise
         finally:
             self._resolving_chain.reset(token)
             self._in_flight.pop(key, None)
 
+        # Cache and resolve any waiters.
         self._cache_values(qname, rdtype, values)
         if not future.done():
             future.set_result(values)

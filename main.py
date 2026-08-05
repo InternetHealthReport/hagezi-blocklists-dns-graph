@@ -39,6 +39,9 @@ MAX_CONCURRENCY = 128
 # use at once (MAX_RACE candidate sockets x up to 3 concurrent query types).
 FDS_PER_DOMAIN = 10
 
+# Per-domain resolution timeout in seconds. Guards against hangs in resolver.
+PER_DOMAIN_TIMEOUT = 30
+
 
 def _raise_fd_limit(min_needed: int) -> None:
     """Raise the process's soft open-file limit as high as the hard limit
@@ -108,7 +111,16 @@ async def resolve_domains(
         nonlocal done
         async with semaphore:
             try:
-                result = await resolver.resolve_full(domain, with_ns_info=with_ns_info)
+                # Guard each individual domain resolve with a timeout so a bug
+                # or unexpected hang in the resolver doesn't stall the whole
+                # worker pool forever.
+                try:
+                    result = await asyncio.wait_for(
+                        resolver.resolve_full(domain, with_ns_info=with_ns_info),
+                        timeout=PER_DOMAIN_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    result = {"hostname": domain, "error": f"timeout after {PER_DOMAIN_TIMEOUT}s"}
             except Exception as exc:  # keep going even if one domain fails
                 result = {"hostname": domain, "error": str(exc)}
         records[domain] = result

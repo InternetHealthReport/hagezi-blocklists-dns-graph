@@ -29,7 +29,7 @@ def resolve_domains(resolver: IterativeResolver, domains: list[str]) -> list[dic
         try:
             return domain, resolver.resolve_full(domain)
         except Exception as exc:  # keep going even if one domain fails
-            return domain, {"domain": domain, "error": str(exc)}
+            return domain, {"hostname": domain, "error": str(exc)}
 
     with cf.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         for domain, result in executor.map(_job, domains):

@@ -124,14 +124,25 @@ class IterativeResolver:
         return None
 
     # -- iterative resolution -------------------------------------------
-    def _resolve_iterative(self, qname: str, rdtype: str) -> Tuple[List[str], List[Dict[str, str]]]:
+    def _resolve_iterative(
+        self, qname: str, rdtype: str
+    ) -> Tuple[List[str], List[Dict[str, str]], Optional[str]]:
         """Resolve `qname`/`rdtype` starting from the root, following
-        referrals. Returns (answer_values, authoritative_nameservers)."""
+        referrals. Returns (answer_values, authoritative_nameservers, zone).
+
+        `zone` is the name of the deepest delegated zone encountered while
+        walking the referral chain (i.e. the zone whose authoritative
+        nameservers were ultimately queried) -- this is effectively the
+        registered/second-level domain the queried name belongs to, as
+        determined directly from the real DNS delegation chain rather than
+        from a static public-suffix list.
+        """
 
         servers = list(ROOT_SERVERS)
         random.shuffle(servers)
         seen_zones = set()
         last_ns_names: List[str] = []
+        last_zone: Optional[str] = None
 
         for _ in range(MAX_REFERRALS):
             response = None
@@ -140,7 +151,7 @@ class IterativeResolver:
                 if response is not None:
                     break
             if response is None:
-                return [], []
+                return [], [], last_zone
 
             # Direct answer.
             if response.answer:
@@ -153,12 +164,12 @@ class IterativeResolver:
                         elif dns.rdatatype.to_text(rdata.rdtype) == rdtype:
                             values.append(rdata.to_text())
                 if values:
-                    return values, self._ns_info(last_ns_names, servers)
+                    return values, self._ns_info(last_ns_names, servers), last_zone
                 if cname_target:
                     # Follow CNAME chain (fresh iterative lookup, cached).
                     values = self.resolve(cname_target, rdtype)
-                    return values, self._ns_info(last_ns_names, servers)
-                return [], self._ns_info(last_ns_names, servers)
+                    return values, self._ns_info(last_ns_names, servers), last_zone
+                return [], self._ns_info(last_ns_names, servers), last_zone
 
             # No direct answer: look for a referral (NS records) in authority.
             ns_names = []
@@ -171,13 +182,14 @@ class IterativeResolver:
 
             if not ns_names:
                 # No delegation and no answer -> NXDOMAIN / NODATA.
-                return [], self._ns_info(last_ns_names, servers)
+                return [], self._ns_info(last_ns_names, servers), last_zone
 
             if zone in seen_zones:
                 # Avoid infinite referral loops.
-                return [], self._ns_info(ns_names, servers)
+                return [], self._ns_info(ns_names, servers), last_zone
             seen_zones.add(zone)
             last_ns_names = ns_names
+            last_zone = zone
 
             # Try glue records first (additional section).
             glue_ips = []
@@ -196,10 +208,10 @@ class IterativeResolver:
                 ips = self.resolve(ns_name, "A")
                 resolved_ips.extend(ips)
             if not resolved_ips:
-                return [], self._ns_info(ns_names, servers)
+                return [], self._ns_info(ns_names, servers), last_zone
             servers = resolved_ips
 
-        return [], []
+        return [], [], last_zone
 
     def _ns_info(self, ns_names: List[str], server_ips: List[str]) -> List[Dict[str, str]]:
         info = []
@@ -233,7 +245,7 @@ class IterativeResolver:
 
         in_progress.add(mem_key)
         try:
-            values, _ = self._resolve_iterative(qname, rdtype)
+            values, _, _ = self._resolve_iterative(qname, rdtype)
         except RecursionError:
             values = []
         finally:
@@ -256,10 +268,19 @@ class IterativeResolver:
 
         a_records = self.resolve(domain, "A")
         aaaa_records = self.resolve(domain, "AAAA")
-        ns_values, ns_info = self._resolve_iterative(domain, "NS")
+        ns_values, ns_info, zone = self._resolve_iterative(domain, "NS")
 
+        hostname = domain.rstrip(".")
+        # `zone` is the deepest delegated zone found while walking the
+        # referral chain for the NS lookup above, i.e. the zone whose
+        # authoritative nameservers actually serve this hostname. That is
+        # exactly the registered/second-level domain, derived directly
+        # from the real DNS delegation chain rather than from a static
+        # public-suffix list.
+        zone_str = zone.rstrip(".") if zone else None
         result = {
-            "domain": domain.rstrip("."),
+            "hostname": hostname,
+            "zone": zone_str,
             "a": sorted(set(a_records)),
             "aaaa": sorted(set(aaaa_records)),
             "nameservers": ns_values or [n["name"] for n in ns_info],

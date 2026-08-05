@@ -187,7 +187,8 @@ def test_resolve_full_returns_expected_shape(tmp_path, monkeypatch):
 
     result = resolver.resolve_full("example.com")
 
-    assert result["domain"] == "example.com"
+    assert result["hostname"] == "example.com"
+    assert result["zone"] == "example.com"
     assert result["a"] == ["1.2.3.4"]
     assert result["aaaa"] == ["::1"]
     assert "nameserver_ips" in result

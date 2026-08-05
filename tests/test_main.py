@@ -26,7 +26,8 @@ class FakeResolver:
     def resolve_full(self, domain):
         self.calls[domain] = self.calls.get(domain, 0) + 1
         return {
-            "domain": domain,
+            "hostname": domain,
+            "zone": domain,
             "a": ["1.2.3.4"],
             "aaaa": [],
             "nameservers": ["ns1.example.com."],
@@ -43,7 +44,7 @@ def test_resolve_domains_preserves_order_and_resolves_each_domain_once():
 
     records = main_module.resolve_domains(resolver, domains)
 
-    assert [r["domain"] for r in records] == domains
+    assert [r["hostname"] for r in records] == domains
     assert resolver.calls == {"a.com": 1, "b.com": 1, "c.com": 1}
 
 
@@ -55,7 +56,7 @@ def test_resolve_domains_handles_duplicate_domains_via_shared_records():
 
     # The output should still have one record per (deduplicated) domain,
     # since results are looked up in a dict keyed by domain.
-    assert {r["domain"] for r in records} == {"a.com", "b.com"}
+    assert {r["hostname"] for r in records} == {"a.com", "b.com"}
 
 
 def test_resolve_domains_continues_on_error(monkeypatch):
@@ -64,13 +65,13 @@ def test_resolve_domains_continues_on_error(monkeypatch):
     def flaky_resolve_full(domain):
         if domain == "bad.com":
             raise RuntimeError("boom")
-        return {"domain": domain, "a": [], "aaaa": [], "nameservers": [], "nameserver_ips": []}
+        return {"hostname": domain, "domain": domain, "a": [], "aaaa": [], "nameservers": [], "nameserver_ips": []}
 
     monkeypatch.setattr(resolver, "resolve_full", flaky_resolve_full)
 
     records = main_module.resolve_domains(resolver, ["good.com", "bad.com"])
 
-    by_domain = {r["domain"]: r for r in records}
+    by_domain = {r["hostname"]: r for r in records}
     assert by_domain["good.com"]["a"] == []
     assert "error" in by_domain["bad.com"]
 

@@ -41,7 +41,8 @@ Each `results/<date>/<list>.json` file looks like:
   "domain_count": 12345,
   "records": [
     {
-      "domain": "example.com",
+      "hostname": "example.com",
+      "zone": "example.com",
       "a": ["93.184.216.34"],
       "aaaa": ["2606:2800:220:1:248:1893:25c8:1946"],
       "nameservers": ["a.iana-servers.net", "b.iana-servers.net"],

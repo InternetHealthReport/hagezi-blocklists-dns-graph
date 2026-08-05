@@ -8,3 +8,9 @@ dependencies = [
     "dnspython>=2.6.1",
     "requests>=2.32.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "responses>=0.25.0",
+]

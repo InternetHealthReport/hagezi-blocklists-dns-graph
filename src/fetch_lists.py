@@ -10,8 +10,9 @@ import requests
 BLOCKLISTS: Dict[str, str] = {
     "fake": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/fake-onlydomains.txt",
     "popup-ads": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/popupads-onlydomains.txt",
-    "threat": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/tif-onlydomains.txt",
-    "nrd": "https://raw.githubusercontent.com/hagezi/nrd/main/domains/nrd7.txt",
+    # "threat": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/tif-onlydomains.txt",
+    "threat-med": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/tif.medium-onlydomains.txt",
+    # "nrd": "https://raw.githubusercontent.com/hagezi/nrd/main/domains/nrd7.txt",
     "nrd-dga": "https://raw.githubusercontent.com/hagezi/nrd/main/domains/dga7.txt",
     "encrypted-dns-resolver": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/doh-onlydomains.txt",
     "dynamic-dns": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/dyndns-onlydomains.txt",

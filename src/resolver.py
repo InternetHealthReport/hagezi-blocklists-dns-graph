@@ -101,6 +101,14 @@ class IterativeResolver:
         # In-memory memoisation for the current process, on top of the
         # disk cache, to avoid re-parsing JSON for repeated lookups.
         self._mem: Dict[str, Any] = {}
+        # Per-thread recursion guard: resolving the NS hostnames for a zone
+        # sometimes requires resolving NS hostnames that are themselves
+        # (glueless) subdomains of the zone being resolved, which can lead
+        # to infinite recursion (e.g. ns.example.com being served by
+        # ns.example.com itself, with no glue). This tracks names currently
+        # "in flight" per thread so such cycles short-circuit instead of
+        # hanging forever.
+        self._in_progress = threading.local()
 
     # -- low level -----------------------------------------------------
     def _send_query(self, server_ip: str, qname: str, rdtype: str) -> Optional[dns.message.Message]:
@@ -213,10 +221,23 @@ class IterativeResolver:
         if mem_key in self._mem:
             return self._mem[mem_key]
 
+        in_progress = getattr(self._in_progress, "keys", None)
+        if in_progress is None:
+            in_progress = set()
+            self._in_progress.keys = in_progress
+
+        if mem_key in in_progress:
+            # Cycle detected (e.g. a nameserver hostname whose own
+            # resolution depends on resolving itself, with no glue).
+            return []
+
+        in_progress.add(mem_key)
         try:
             values, _ = self._resolve_iterative(qname, rdtype)
         except RecursionError:
             values = []
+        finally:
+            in_progress.discard(mem_key)
 
         self.cache.set(qname, rdtype, values)
         self._mem[mem_key] = values

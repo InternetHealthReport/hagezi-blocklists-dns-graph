@@ -15,15 +15,34 @@ from src.fetch_lists import fetch_all_lists
 from src.resolver import IterativeResolver
 
 RESULTS_DIR = Path("results")
-CACHE_PATH = Path(".cache") / "dns_cache.json"
-MAX_WORKERS = 16
+MAX_WORKERS = 4096
+
+# How often the progress bar is redrawn, in completed domains. Rendering on
+# every single completion means a formatted, flushed stderr write per domain
+# from a loop fed by thousands of worker threads, which is pure overhead.
+PROGRESS_EVERY = 100
 
 
-def resolve_domains(resolver: IterativeResolver, domains: list[str]) -> list[dict]:
+def _print_progress(prefix: str, done: int, total: int, bar_width: int = 40) -> None:
+    """Render a simple in-place progress bar on stderr."""
+    fraction = done / total if total else 1.0
+    filled = int(bar_width * fraction)
+    bar = "#" * filled + "-" * (bar_width - filled)
+    print(
+        f"\r{prefix} [{bar}] {done}/{total} ({fraction * 100:5.1f}%)",
+        end="" if done < total else "\n",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def resolve_domains(resolver: IterativeResolver, domains: list[str], list_name: str = "") -> list[dict]:
     """Resolve a list of domains, using a thread pool for concurrency while
     still going through the resolver's shared cache (so duplicate domains,
     even across lists, are only ever queried once)."""
     records: dict[str, dict] = {}
+    total = len(domains)
+    prefix = f"  {list_name}" if list_name else "  Resolving"
 
     def _job(domain: str):
         try:
@@ -31,9 +50,14 @@ def resolve_domains(resolver: IterativeResolver, domains: list[str]) -> list[dic
         except Exception as exc:  # keep going even if one domain fails
             return domain, {"hostname": domain, "error": str(exc)}
 
+    done = 0
+    _print_progress(prefix, done, total)
     with cf.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         for domain, result in executor.map(_job, domains):
             records[domain] = result
+            done += 1
+            if done % PROGRESS_EVERY == 0 or done == total:
+                _print_progress(prefix, done, total)
 
     return [records[d] for d in domains if d in records]
 
@@ -61,12 +85,11 @@ def main() -> None:
     if args.only:
         all_lists = {k: v for k, v in all_lists.items() if k in args.only}
 
-    resolver = IterativeResolver(cache_path=CACHE_PATH)
+    resolver = IterativeResolver()
 
     for name, domains in all_lists.items():
         print(f"Resolving {len(domains)} domains for list '{name}'...", file=sys.stderr)
-        records = resolve_domains(resolver, domains)
-        resolver.save()  # persist cache incrementally
+        records = resolve_domains(resolver, domains, list_name=name)
 
         output = {
             "list": name,
@@ -78,7 +101,6 @@ def main() -> None:
         out_path.write_text(json.dumps(output, indent=2))
         print(f"Wrote {out_path}", file=sys.stderr)
 
-    resolver.save()
     print("Done.", file=sys.stderr)
 
 

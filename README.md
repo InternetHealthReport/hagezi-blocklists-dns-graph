@@ -14,9 +14,9 @@ one file per list, per day.
   starts at the root servers and follows NS referrals down to the
   authoritative servers itself, instead of hammering a single recursive
   resolver. Every lookup (A/AAAA/NS, including nameserver hostname
-  resolution) is cached on disk in `.cache/dns_cache.json`, so a domain
-  that appears in several lists -- or is resolved again the next day
-  before its TTL expires -- is only ever queried once.
+  resolution) is cached in memory, along with the zone cuts discovered
+  along the way, so a domain that appears in several lists is only ever
+  queried once and lookups sharing a TLD skip the root servers entirely.
 - `main.py` orchestrates fetching + resolving (with a thread pool, since
   the DNS cache is shared and thread-safe) and writes
   `results/<date>/<list-name>.json` files, e.g. `results/2024-05-01/nrd.json`.

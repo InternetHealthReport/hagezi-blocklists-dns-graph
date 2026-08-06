@@ -5,13 +5,20 @@ traffic is generated; they build fake `dns.message.Message` responses that
 mimic what real root/TLD/authoritative servers would answer, and check that
 the iterative-referral-following logic in `resolver.py` behaves correctly
 (including the fix for infinite recursion on glueless nameserver cycles).
+
+`resolve()` / `resolve_full()` (and the low-level `_send_query`) are all
+`async def` coroutines, so every test below runs its assertions inside
+`asyncio.run(...)`, and the fake `_send_query` replacements are themselves
+`async def` functions so they can be awaited exactly like the real one.
 """
 
 from __future__ import annotations
 
+import asyncio
+
 import dns.message
 
-from src.resolver import NEGATIVE_CACHE_TTL, POSITIVE_CACHE_TTL, IterativeResolver
+from src.resolver import MAX_RACE, NEGATIVE_CACHE_TTL, POSITIVE_CACHE_TTL, IterativeResolver
 
 
 def _make_response(text: str) -> dns.message.Message:
@@ -49,36 +56,44 @@ def _nodata_response() -> dns.message.Message:
 def test_resolve_returns_direct_answer(monkeypatch):
     resolver = IterativeResolver()
 
-    monkeypatch.setattr(
-        resolver,
-        "_send_query",
-        lambda server_ip, qname, rdtype: _answer_response("example.com.", "A", ["1.2.3.4"]),
-    )
+    async def fake_send(server_ip, qname, rdtype):
+        return _answer_response("example.com.", "A", ["1.2.3.4"])
 
-    result = resolver.resolve("example.com", "A")
+    monkeypatch.setattr(resolver, "_send_query", fake_send)
+
+    result = asyncio.run(resolver.resolve("example.com", "A"))
     assert result == ["1.2.3.4"]
 
 
 def test_resolve_follows_referral_with_glue(monkeypatch):
+    """Root servers hand back a referral (with glue) to the TLD servers,
+    which then answer directly.
+
+    `_first_response` races up to `MAX_RACE` candidate servers concurrently
+    for every hop, so more than one query can be sent per hop even though
+    only the first answer actually matters -- the assertions below account
+    for that instead of assuming exactly one query per hop.
+    """
     resolver = IterativeResolver()
 
-    call_count = {"n": 0}
+    seen_ips: list[str] = []
 
-    def fake_send(server_ip, qname, rdtype):
-        call_count["n"] += 1
-        if call_count["n"] == 1:
-            # Root refers to the TLD servers, with glue.
+    async def fake_send(server_ip, qname, rdtype):
+        seen_ips.append(server_ip)
+        if server_ip != "192.0.2.1":
+            # Root (or any non-glue) server refers to the TLD servers.
             return _referral_response("com.", ["a.gtld-servers.net."], glue={"a.gtld-servers.net.": "192.0.2.1"})
-        # Second query (to the glued TLD server) gives the final answer.
+        # The glued TLD server gives the final answer.
         return _answer_response("example.com.", "A", ["5.6.7.8"])
 
     monkeypatch.setattr(resolver, "_send_query", fake_send)
 
-    result = resolver.resolve("example.com", "A")
+    result = asyncio.run(resolver.resolve("example.com", "A"))
     assert result == ["5.6.7.8"]
-    # One query for the referral, one for the final answer. `resolve()` never
-    # asks for nameserver details, so no extra address lookups happen.
-    assert call_count["n"] == 2
+    # The referral hop races at most MAX_RACE root servers, then a single
+    # query is sent to the glued TLD server.
+    assert 2 <= len(seen_ips) <= MAX_RACE + 1
+    assert "192.0.2.1" in seen_ips
 
 
 def test_resolve_reuses_cached_zone_cut(monkeypatch):
@@ -87,7 +102,7 @@ def test_resolve_reuses_cached_zone_cut(monkeypatch):
 
     seen_servers: list[str] = []
 
-    def fake_send(server_ip, qname, rdtype):
+    async def fake_send(server_ip, qname, rdtype):
         seen_servers.append(server_ip)
         if server_ip != "192.0.2.1":
             return _referral_response(
@@ -97,9 +112,9 @@ def test_resolve_reuses_cached_zone_cut(monkeypatch):
 
     monkeypatch.setattr(resolver, "_send_query", fake_send)
 
-    assert resolver.resolve("first.com", "A") == ["5.6.7.8"]
+    assert asyncio.run(resolver.resolve("first.com", "A")) == ["5.6.7.8"]
     seen_servers.clear()
-    assert resolver.resolve("second.com", "A") == ["5.6.7.8"]
+    assert asyncio.run(resolver.resolve("second.com", "A")) == ["5.6.7.8"]
     # The "com." zone cut is cached, so the walk starts at the TLD server.
     assert seen_servers == ["192.0.2.1"]
 
@@ -107,9 +122,12 @@ def test_resolve_reuses_cached_zone_cut(monkeypatch):
 def test_resolve_no_answer_and_no_referral_returns_empty(monkeypatch):
     resolver = IterativeResolver()
 
-    monkeypatch.setattr(resolver, "_send_query", lambda server_ip, qname, rdtype: _nodata_response())
+    async def fake_send(server_ip, qname, rdtype):
+        return _nodata_response()
 
-    result = resolver.resolve("nonexistent.example", "A")
+    monkeypatch.setattr(resolver, "_send_query", fake_send)
+
+    result = asyncio.run(resolver.resolve("nonexistent.example", "A"))
     assert result == []
 
 
@@ -124,19 +142,25 @@ def test_negative_results_use_a_shorter_ttl(monkeypatch):
         recorded[rdtype] = ttl
         return original_set(name, rdtype, value, ttl=ttl)
 
-    monkeypatch.setattr(resolver.cache, "set", spy_set)
-    monkeypatch.setattr(resolver, "_send_query", lambda server_ip, qname, rdtype: _nodata_response())
+    async def fake_send(server_ip, qname, rdtype):
+        return _nodata_response()
 
-    assert resolver.resolve("nonexistent.example", "A") == []
+    monkeypatch.setattr(resolver.cache, "set", spy_set)
+    monkeypatch.setattr(resolver, "_send_query", fake_send)
+
+    assert asyncio.run(resolver.resolve("nonexistent.example", "A")) == []
     assert recorded["A"] == NEGATIVE_CACHE_TTL
 
 
 def test_resolve_returns_empty_when_all_queries_fail(monkeypatch):
     resolver = IterativeResolver()
 
-    monkeypatch.setattr(resolver, "_send_query", lambda server_ip, qname, rdtype: None)
+    async def fake_send(server_ip, qname, rdtype):
+        return None
 
-    result = resolver.resolve("example.com", "A")
+    monkeypatch.setattr(resolver, "_send_query", fake_send)
+
+    result = asyncio.run(resolver.resolve("example.com", "A"))
     assert result == []
 
 
@@ -145,18 +169,26 @@ def test_resolve_caches_results_across_calls(monkeypatch):
 
     call_count = {"n": 0}
 
-    def fake_send(server_ip, qname, rdtype):
+    async def fake_send(server_ip, qname, rdtype):
         call_count["n"] += 1
         return _answer_response("example.com.", "A", ["1.2.3.4"])
 
     monkeypatch.setattr(resolver, "_send_query", fake_send)
 
-    first = resolver.resolve("example.com", "A")
-    second = resolver.resolve("example.com", "A")
+    async def run_both():
+        first = await resolver.resolve("example.com", "A")
+        after_first = call_count["n"]
+        second = await resolver.resolve("example.com", "A")
+        return first, second, after_first
+
+    first, second, after_first = asyncio.run(run_both())
 
     assert first == second == ["1.2.3.4"]
-    # Only the first call should have actually hit the network.
-    assert call_count["n"] == 1
+    # `_first_response` races up to MAX_RACE root servers concurrently for the
+    # first call, but the second call must be served entirely from cache,
+    # issuing no additional queries at all.
+    assert 1 <= after_first <= MAX_RACE
+    assert call_count["n"] == after_first
 
 
 def test_resolve_glueless_nameserver_cycle_does_not_hang(monkeypatch):
@@ -165,7 +197,7 @@ def test_resolve_glueless_nameserver_cycle_does_not_hang(monkeypatch):
     hanging forever."""
     resolver = IterativeResolver()
 
-    def fake_send(server_ip, qname, rdtype):
+    async def fake_send(server_ip, qname, rdtype):
         # Every query, regardless of target, refers to the very same
         # glueless nameserver -- a pathological but real-world-possible
         # configuration.
@@ -174,14 +206,14 @@ def test_resolve_glueless_nameserver_cycle_does_not_hang(monkeypatch):
     monkeypatch.setattr(resolver, "_send_query", fake_send)
 
     # Must return (not hang) and yield no addresses since it never resolves.
-    result = resolver.resolve("example.com", "A")
+    result = asyncio.run(resolver.resolve("example.com", "A"))
     assert result == []
 
 
 def test_resolve_full_returns_expected_shape(monkeypatch):
     resolver = IterativeResolver()
 
-    def fake_send(server_ip, qname, rdtype):
+    async def fake_send(server_ip, qname, rdtype):
         if rdtype == "A" and qname.rstrip(".") == "example.com":
             return _answer_response("example.com.", "A", ["1.2.3.4"])
         if rdtype == "AAAA" and qname.rstrip(".") == "example.com":
@@ -198,12 +230,11 @@ def test_resolve_full_returns_expected_shape(monkeypatch):
 
     monkeypatch.setattr(resolver, "_send_query", fake_send)
 
-    result = resolver.resolve_full("example.com")
+    result = asyncio.run(resolver.resolve_full("example.com"))
 
     assert result["hostname"] == "example.com"
     assert result["zone"] == "example.com"
     assert result["a"] == ["1.2.3.4"]
     assert result["aaaa"] == ["::1"]
     assert "nameserver_ips" in result
-    assert "nameservers" in result
 

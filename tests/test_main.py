@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -17,13 +18,20 @@ from src.resolver import IterativeResolver
 class FakeResolver:
     """Stand-in for IterativeResolver that avoids any network access and
     tracks how many times each domain was actually resolved, to verify the
-    shared-cache behaviour across lists."""
+    shared-cache behaviour across lists.
+
+    `resolve_full` is `async def` to match the real `IterativeResolver`
+    (`main.resolve_domains` awaits it via `asyncio.wait_for`), and a
+    `stats` attribute is provided since `main._run` unconditionally prints
+    `resolver.stats.report()`.
+    """
 
     def __init__(self):
         self.calls = {}
         self.saved = 0
+        self.stats = type("Stats", (), {"report": lambda self: "fake stats"})()
 
-    def resolve_full(self, domain):
+    async def resolve_full(self, domain, with_ns_info=True):
         self.calls[domain] = self.calls.get(domain, 0) + 1
         return {
             "hostname": domain,
@@ -42,7 +50,7 @@ def test_resolve_domains_preserves_order_and_resolves_each_domain_once():
     resolver = FakeResolver()
     domains = ["a.com", "b.com", "c.com"]
 
-    records = main_module.resolve_domains(resolver, domains)
+    records = asyncio.run(main_module.resolve_domains(resolver, domains))
 
     assert [r["hostname"] for r in records] == domains
     assert resolver.calls == {"a.com": 1, "b.com": 1, "c.com": 1}
@@ -52,7 +60,7 @@ def test_resolve_domains_handles_duplicate_domains_via_shared_records():
     resolver = FakeResolver()
     domains = ["a.com", "a.com", "b.com"]
 
-    records = main_module.resolve_domains(resolver, domains)
+    records = asyncio.run(main_module.resolve_domains(resolver, domains))
 
     # The output should still have one record per (deduplicated) domain,
     # since results are looked up in a dict keyed by domain.
@@ -62,14 +70,14 @@ def test_resolve_domains_handles_duplicate_domains_via_shared_records():
 def test_resolve_domains_continues_on_error(monkeypatch):
     resolver = FakeResolver()
 
-    def flaky_resolve_full(domain):
+    async def flaky_resolve_full(domain, with_ns_info=True):
         if domain == "bad.com":
             raise RuntimeError("boom")
         return {"hostname": domain, "domain": domain, "a": [], "aaaa": [], "nameservers": [], "nameserver_ips": []}
 
     monkeypatch.setattr(resolver, "resolve_full", flaky_resolve_full)
 
-    records = main_module.resolve_domains(resolver, ["good.com", "bad.com"])
+    records = asyncio.run(main_module.resolve_domains(resolver, ["good.com", "bad.com"]))
 
     by_domain = {r["hostname"]: r for r in records}
     assert by_domain["good.com"]["a"] == []

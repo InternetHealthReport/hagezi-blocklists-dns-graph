@@ -79,6 +79,152 @@ NEGATIVE_CACHE_TTL = 300
 MAX_GLUELESS_NS = 4
 
 
+class ResolverStats:
+    """Lightweight counters/timers describing what a resolver run spent its
+    time and queries on.
+
+    No locking is needed here either: like the rest of this module, all
+    increments happen on a single asyncio event loop between `await`
+    points, so plain int/float mutation is inherently safe.
+    """
+
+    def __init__(self) -> None:
+        # Wall-clock start time, used to compute real throughput
+        # (domains/sec) across the whole run. This is distinct from
+        # `domain_time_total`/`avg_domain_s` below, which sum each
+        # individual domain's own latency: since domains are resolved
+        # concurrently (bounded by a semaphore in main.py), the sum of
+        # per-domain latencies can be many times the actual wall-clock
+        # duration of the run, so the two numbers must not be confused.
+        self.start_time = time.monotonic()
+
+        # Top-level name+type cache (the one consulted by `resolve()` /
+        # `_lookup_at()`).
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+        # Zone-cut cache (`_best_cached_zone` / `_cache_zone`), i.e. how
+        # often we could skip straight to a known TLD/zone's servers
+        # instead of starting the referral walk from the root.
+        self.zone_cache_hits = 0
+        self.zone_cache_misses = 0
+
+        # In-flight de-duplication: another coroutine was already resolving
+        # the exact same name+type, so this call piggybacked on it instead
+        # of issuing its own queries.
+        self.dedup_hits = 0
+
+        # Low-level wire queries, one increment per server contacted.
+        self.queries_sent = 0
+        self.queries_answered = 0
+        self.query_timeouts = 0  # dns.exception.Timeout
+        self.query_errors = 0  # OSError / other dns.exception.DNSException
+        self.query_time_total = 0.0  # sum of per-query wall-clock seconds
+
+        # Referral-walk bookkeeping.
+        self.referrals_followed = 0
+        self.glueless_lookups = 0
+        self.nxdomain_count = 0  # no answer and no further delegation
+        self.referral_loops = 0  # zone seen twice -> loop guard triggered
+
+        # Whole-domain (resolve_full) bookkeeping.
+        self.domains_resolved = 0
+        self.domain_timeouts = 0
+        self.domain_time_total = 0.0
+
+    def record_query(self, elapsed: float, outcome: str) -> None:
+        """Record the outcome of a single `_send_query` attempt.
+
+        `outcome` is one of "answered", "timeout", "error".
+        """
+        self.queries_sent += 1
+        self.query_time_total += elapsed
+        if outcome == "answered":
+            self.queries_answered += 1
+        elif outcome == "timeout":
+            self.query_timeouts += 1
+        else:
+            self.query_errors += 1
+
+    def record_domain(self, elapsed: float, timed_out: bool = False) -> None:
+        self.domains_resolved += 1
+        self.domain_time_total += elapsed
+        if timed_out:
+            self.domain_timeouts += 1
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Return a plain dict of all counters plus a few derived averages,
+        suitable for logging or dumping as JSON."""
+        avg_query_ms = (
+            (self.query_time_total / self.queries_sent) * 1000 if self.queries_sent else 0.0
+        )
+        # `avg_domain_s` is the average of each domain's own resolution
+        # latency (time spent inside `resolve_full` for that one domain).
+        # Because domains are resolved concurrently (bounded by a semaphore
+        # in main.py), this is NOT the same as "total wall-clock time /
+        # domains resolved" -- summing per-domain latencies double (or
+        # N-times) counts time that overlapped across concurrent domains.
+        avg_domain_s = (
+            self.domain_time_total / self.domains_resolved if self.domains_resolved else 0.0
+        )
+        # Real wall-clock elapsed time since this ResolverStats was created,
+        # and the actual throughput that implies -- this is the number that
+        # reflects how long a run actually took / will take, unlike
+        # `avg_domain_s` above.
+        elapsed_wall_s = time.monotonic() - self.start_time
+        domains_per_sec = (
+            self.domains_resolved / elapsed_wall_s if elapsed_wall_s > 0 else 0.0
+        )
+        total_cache_lookups = self.cache_hits + self.cache_misses
+        cache_hit_rate = (
+            self.cache_hits / total_cache_lookups if total_cache_lookups else 0.0
+        )
+        return {
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "cache_hit_rate": cache_hit_rate,
+            "zone_cache_hits": self.zone_cache_hits,
+            "zone_cache_misses": self.zone_cache_misses,
+            "dedup_hits": self.dedup_hits,
+            "queries_sent": self.queries_sent,
+            "queries_answered": self.queries_answered,
+            "query_timeouts": self.query_timeouts,
+            "query_errors": self.query_errors,
+            "avg_query_ms": avg_query_ms,
+            "referrals_followed": self.referrals_followed,
+            "glueless_lookups": self.glueless_lookups,
+            "nxdomain_count": self.nxdomain_count,
+            "referral_loops": self.referral_loops,
+            "domains_resolved": self.domains_resolved,
+            "domain_timeouts": self.domain_timeouts,
+            "avg_domain_s": avg_domain_s,
+            "elapsed_wall_s": elapsed_wall_s,
+            "domains_per_sec": domains_per_sec,
+        }
+
+    def report(self) -> str:
+        """Render a short human-readable multi-line summary."""
+        s = self.snapshot()
+        lines = [
+            "Resolver stats:",
+            f"  name+type cache : {s['cache_hits']} hits / {s['cache_misses']} misses "
+            f"({s['cache_hit_rate'] * 100:.1f}% hit rate)",
+            f"  zone-cut cache  : {s['zone_cache_hits']} hits / {s['zone_cache_misses']} misses",
+            f"  dedup piggybacks: {s['dedup_hits']}",
+            f"  wire queries    : {s['queries_sent']} sent, {s['queries_answered']} answered, "
+            f"{s['query_timeouts']} timed out, {s['query_errors']} errored "
+            f"(avg {s['avg_query_ms']:.1f} ms/query)",
+            f"  referral walk   : {s['referrals_followed']} referrals, "
+            f"{s['glueless_lookups']} glueless NS lookups, {s['referral_loops']} loops detected, "
+            f"{s['nxdomain_count']} NXDOMAIN/NODATA",
+            f"  domains         : {s['domains_resolved']} resolved, {s['domain_timeouts']} timed out "
+            f"(avg {s['avg_domain_s']:.3f} s/domain latency, concurrent)",
+            f"  throughput      : {s['elapsed_wall_s']:.1f} s wall-clock, "
+            f"{s['domains_per_sec']:.1f} domains/sec",
+        ]
+        return "\n".join(lines)
+
+
 class MemoryCache:
     """A small in-memory cache, keyed by "name|rdtype".
 
@@ -87,8 +233,9 @@ class MemoryCache:
     interleaved with another coroutine's dict operations.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, stats: Optional[ResolverStats] = None) -> None:
         self._data: Dict[str, Any] = {}
+        self._stats = stats
 
     @staticmethod
     def _key(name: str, rdtype: str) -> str:
@@ -96,10 +243,12 @@ class MemoryCache:
 
     def get(self, name: str, rdtype: str) -> Optional[Any]:
         entry = self._data.get(self._key(name, rdtype))
-        if entry is None:
+        if entry is None or entry["expires"] < time.time():
+            if self._stats is not None:
+                self._stats.cache_misses += 1
             return None
-        if entry["expires"] < time.time():
-            return None
+        if self._stats is not None:
+            self._stats.cache_hits += 1
         return entry["value"]
 
     def set(self, name: str, rdtype: str, value: Any, ttl: int = POSITIVE_CACHE_TTL) -> None:
@@ -124,7 +273,8 @@ class IterativeResolver:
     """
 
     def __init__(self) -> None:
-        self.cache = MemoryCache()
+        self.stats = ResolverStats()
+        self.cache = MemoryCache(stats=self.stats)
 
         # Recursion/cycle guard: resolving the NS hostnames for a zone
         # sometimes requires resolving NS hostnames that are themselves
@@ -159,13 +309,22 @@ class IterativeResolver:
     # -- low level -----------------------------------------------------
     async def _send_query(self, server_ip: str, qname: str, rdtype: str) -> Optional[dns.message.Message]:
         q = dns.message.make_query(qname, rdtype, want_dnssec=False)
+        last_outcome = "error"
         for _attempt in range(QUERY_RETRIES):
+            start = time.monotonic()
             try:
                 response = await dns.asyncquery.udp(q, server_ip, timeout=QUERY_TIMEOUT)
                 if response.flags & dns.flags.TC:
                     response = await dns.asyncquery.tcp(q, server_ip, timeout=QUERY_TIMEOUT)
+                self.stats.record_query(time.monotonic() - start, "answered")
                 return response
-            except (dns.exception.Timeout, OSError, dns.exception.DNSException):
+            except dns.exception.Timeout:
+                self.stats.record_query(time.monotonic() - start, "timeout")
+                last_outcome = "timeout"
+                continue
+            except (OSError, dns.exception.DNSException):
+                self.stats.record_query(time.monotonic() - start, "error")
+                last_outcome = "error"
                 continue
         return None
 
@@ -246,7 +405,9 @@ class IterativeResolver:
         for candidate in candidates:
             ips = self._zone_cache.get(candidate)
             if ips:
+                self.stats.zone_cache_hits += 1
                 return candidate, list(ips)
+        self.stats.zone_cache_misses += 1
         return None
 
     def _cache_zone(self, zone: str, server_ips: List[str]) -> None:
@@ -339,14 +500,17 @@ class IterativeResolver:
 
             if not ns_names:
                 # No delegation and no answer -> NXDOMAIN / NODATA.
+                self.stats.nxdomain_count += 1
                 return [], await ns_info(last_ns_names), last_zone, servers
 
             if zone in seen_zones:
                 # Avoid infinite referral loops.
+                self.stats.referral_loops += 1
                 return [], await ns_info(ns_names), last_zone, servers
             seen_zones.add(zone)
             last_ns_names = ns_names
             last_zone = zone
+            self.stats.referrals_followed += 1
 
             # Try glue records first (additional section).
             glue_ips = []
@@ -365,6 +529,7 @@ class IterativeResolver:
 
             # No glue: resolve NS hostnames ourselves (cached), in parallel
             # rather than one at a time.
+            self.stats.glueless_lookups += 1
             resolved_lists = await asyncio.gather(
                 *(self.resolve(ns_name, "A") for ns_name in ns_names[:MAX_GLUELESS_NS])
             )
@@ -423,6 +588,7 @@ class IterativeResolver:
             # cancellation only detaches us from the future (still raising
             # CancelledError here, as expected) without cancelling it for
             # everyone else.
+            self.stats.dedup_hits += 1
             return await asyncio.shield(existing)
 
         loop = asyncio.get_event_loop()
@@ -513,20 +679,29 @@ class IterativeResolver:
         of DNS round trips per domain when nameserver IPs aren't required.
         """
         domain = domain.rstrip(".") + "."
+        start = time.monotonic()
+        timed_out = False
 
-        # Walk the delegation chain once (via the NS lookup), then reuse the
-        # resulting authoritative servers for the A and AAAA queries instead
-        # of repeating the whole referral chain for each record type.
-        ns_values, ns_info, zone, servers = await self._resolve_iterative(
-            domain, "NS", with_ns_info=with_ns_info
-        )
+        try:
+            # Walk the delegation chain once (via the NS lookup), then reuse
+            # the resulting authoritative servers for the A and AAAA queries
+            # instead of repeating the whole referral chain for each record
+            # type.
+            ns_values, ns_info, zone, servers = await self._resolve_iterative(
+                domain, "NS", with_ns_info=with_ns_info
+            )
 
-        # A and AAAA share the same authoritative servers, so fetch them
-        # concurrently instead of one after the other.
-        a_records, aaaa_records = await asyncio.gather(
-            self._lookup_at(servers, domain, "A"),
-            self._lookup_at(servers, domain, "AAAA"),
-        )
+            # A and AAAA share the same authoritative servers, so fetch them
+            # concurrently instead of one after the other.
+            a_records, aaaa_records = await asyncio.gather(
+                self._lookup_at(servers, domain, "A"),
+                self._lookup_at(servers, domain, "AAAA"),
+            )
+        except asyncio.TimeoutError:
+            timed_out = True
+            raise
+        finally:
+            self.stats.record_domain(time.monotonic() - start, timed_out=timed_out)
 
         # `zone` is the deepest delegated zone found while walking the
         # referral chain for the NS lookup above, i.e. the zone whose

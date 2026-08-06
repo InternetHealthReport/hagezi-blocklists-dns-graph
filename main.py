@@ -33,14 +33,14 @@ RESULTS_DIR = Path("results")
 # MAX_CONCURRENCY. This must stay comfortably under the process's open-file
 # limit (see `_raise_fd_limit` below), or queries will silently fail with
 # OSError ("too many open files") and get cached as negative results.
-MAX_CONCURRENCY = 128
+MAX_CONCURRENCY = 256
 
 # Rough upper bound on file descriptors a single in-flight resolution can
 # use at once (MAX_RACE candidate sockets x up to 3 concurrent query types).
 FDS_PER_DOMAIN = 10
 
 # Per-domain resolution timeout in seconds. Guards against hangs in resolver.
-PER_DOMAIN_TIMEOUT = 30
+PER_DOMAIN_TIMEOUT = 10
 
 
 def _raise_fd_limit(min_needed: int) -> None:
@@ -159,6 +159,7 @@ async def _run(args: argparse.Namespace) -> None:
         out_path.write_text(json.dumps(output, indent=2))
         print(f"Wrote {out_path}", file=sys.stderr)
 
+    print(resolver.stats.report(), file=sys.stderr)
     print("Done.", file=sys.stderr)
 
 

@@ -31,15 +31,6 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
-      - name: Restore DNS cache
-        uses: actions/cache@v4
-        with:
-          path: .cache
-          key: dns-cache-${{ github.run_id }}-${{ matrix.shard }}
-          restore-keys: |
-            dns-cache-${{ matrix.shard }}-
-            dns-cache-
-
       - name: Compute run date
         id: date
         run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
@@ -47,14 +38,18 @@ jobs:
       - name: Compute lists for this shard
         id: lists
         run: |
-          uv run python -c "
+          uv run python - <<'PY'
           from src.fetch_lists import BLOCKLISTS
           names = sorted(BLOCKLISTS)
-          shard = ${{ matrix.shard }}
+          # Exclude very long lists that will run on dedicated self-hosted runners
+          exclude = {'nrd-dga', 'threat-med'}
+          names = [n for n in names if n not in exclude]
+          shard = int("${{ matrix.shard }}")
           total_shards = 4
           selected = [n for i, n in enumerate(names) if i % total_shards == shard]
           print('lists=' + ' '.join(selected))
-          " >> "$GITHUB_OUTPUT"
+          PY
+          >> "$GITHUB_OUTPUT"
 
       - name: Resolve blocklists (shard ${{ matrix.shard }})
         run: uv run main.py --date "${{ steps.date.outputs.date }}" --only ${{ steps.lists.outputs.lists }}
@@ -65,8 +60,70 @@ jobs:
           name: results-shard-${{ matrix.shard }}
           path: results/${{ steps.date.outputs.date }}
 
+  nrd_dga:
+    # Run on a dedicated runner
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Compute run date
+        id: date
+        run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve nrd-dga list
+        run: uv run main.py --date "${{ steps.date.outputs.date }}" --only nrd-dga
+
+      - name: Upload results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-nrd-dga
+          path: results/${{ steps.date.outputs.date }}
+
+  threat_med:
+    # Run on a dedicated runner
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Compute run date
+        id: date
+        run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve threat-med list
+        run: uv run main.py --date "${{ steps.date.outputs.date }}" --only threat-med
+
+      - name: Upload results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-threat-med
+          path: results/${{ steps.date.outputs.date }}
+
   commit:
-    needs: resolve
+    needs: [resolve, nrd_dga, threat_med]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -76,10 +133,10 @@ jobs:
         id: date
         run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
 
-      - name: Download all shard results
+      - name: Download all results
         uses: actions/download-artifact@v4
         with:
-          pattern: results-shard-*
+          pattern: results-*
           path: results/${{ steps.date.outputs.date }}
           merge-multiple: true
 

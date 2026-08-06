@@ -413,7 +413,17 @@ class IterativeResolver:
         # zone).
         existing = self._in_flight.get(key)
         if existing is not None:
-            return await existing
+            # `existing` is a single Future shared by every coroutine
+            # currently resolving this exact name+type. If we awaited it
+            # directly, cancelling *this* caller (e.g. via the per-domain
+            # `asyncio.wait_for` timeout in main.py) would cancel the
+            # future itself, which would incorrectly propagate
+            # CancelledError to every other unrelated coroutine piggybacking
+            # on the same lookup. `asyncio.shield` ensures our own
+            # cancellation only detaches us from the future (still raising
+            # CancelledError here, as expected) without cancelling it for
+            # everyone else.
+            return await asyncio.shield(existing)
 
         loop = asyncio.get_event_loop()
         future: "asyncio.Future[List[str]]" = loop.create_future()
@@ -503,10 +513,6 @@ class IterativeResolver:
         of DNS round trips per domain when nameserver IPs aren't required.
         """
         domain = domain.rstrip(".") + "."
-        cache_key = "FULL" if with_ns_info else "FULL_NO_NS"
-        cached = self.cache.get(domain, cache_key)
-        if cached is not None:
-            return cached
 
         # Walk the delegation chain once (via the NS lookup), then reuse the
         # resulting authoritative servers for the A and AAAA queries instead
@@ -535,6 +541,5 @@ class IterativeResolver:
             "aaaa": sorted(set(aaaa_records)),
             "nameserver_ips": [n for n in ns_info if n.get("ip")],
         }
-        self.cache.set(domain, cache_key, result)
         return result
 

@@ -57,7 +57,7 @@ MAX_CONCURRENCY = 100
 FDS_PER_DOMAIN = 10
 
 # Per-domain resolution timeout in seconds. Guards against hangs in resolver.
-PER_DOMAIN_TIMEOUT = 10
+PER_DOMAIN_TIMEOUT = 30
 
 # Default number of worker *processes* used to resolve a single list.
 #

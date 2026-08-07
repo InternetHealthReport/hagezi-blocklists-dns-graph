@@ -297,6 +297,15 @@ class IterativeResolver:
         # re-running the whole referral walk.
         self._in_flight: Dict[str, "asyncio.Future[List[str]]"] = {}
 
+        # Dedup + cache in-flight/completed NS referral walks performed by
+        # `resolve_full` (see `_resolve_ns_walk`). Kept separate from
+        # `_in_flight` above because it stores a different result shape
+        # (the full (values, ns_info, zone, servers) tuple, not just a list
+        # of record values).
+        self._ns_walk_in_flight: Dict[
+            str, "asyncio.Future[Tuple[List[str], List[Dict[str, str]], Optional[str], List[str]]]"
+        ] = {}
+
         # Zone-cut cache: maps a delegated zone name (e.g. "com.") to the
         # IPs of its authoritative servers. Since thousands of domains in a
         # blocklist typically share only a handful of TLDs (and often the
@@ -305,6 +314,19 @@ class IterativeResolver:
         # instead of re-walking the referral chain from scratch each time.
         # This is the single biggest speedup for bulk resolution.
         self._zone_cache: Dict[str, List[str]] = {}
+
+        # Cache of completed NS referral walks performed by `resolve_full`
+        # via `_resolve_ns_walk` (see `_ns_walk_in_flight` above). Unlike
+        # the top-level `MemoryCache`, entries here store the full
+        # (values, ns_info, zone, servers) tuple, keyed by
+        # "domain|NS|with_ns_info", since `resolve_full` needs both the
+        # zone/servers (to reuse for the A/AAAA `_lookup_at` calls) and the
+        # ns_info (which is only computed when `with_ns_info` is true, so
+        # it must be part of the cache key to avoid serving a cached entry
+        # built without ns_info to a caller that requested it).
+        self._ns_walk_cache: Dict[
+            str, Tuple[List[str], List[Dict[str, str]], Optional[str], List[str], float]
+        ] = {}
 
     # -- low level -----------------------------------------------------
     async def _send_query(self, server_ip: str, qname: str, rdtype: str) -> Optional[dns.message.Message]:
@@ -541,6 +563,64 @@ class IterativeResolver:
 
         return [], [], last_zone, servers
 
+    async def _resolve_ns_walk(
+        self, domain: str, with_ns_info: bool
+    ) -> Tuple[List[str], List[Dict[str, str]], Optional[str], List[str]]:
+        """Cached + deduped wrapper around `_resolve_iterative(domain, "NS")`.
+
+        `resolve_full` used to call `_resolve_iterative` directly for its NS
+        lookup, which bypassed both the top-level `MemoryCache` and the
+        `_in_flight` dedup that `resolve()` benefits from. That meant a
+        domain occurring more than once in a merged blocklist (or resolved
+        concurrently more than once) would re-walk the whole NS referral
+        chain from scratch every time -- unlike its A/AAAA counterparts,
+        which already go through the cached `_lookup_at()`. This wrapper
+        closes that gap by caching (and deduping in-flight) the full
+        (values, ns_info, zone, servers) tuple, keyed by
+        "domain|NS|with_ns_info" so a cached entry built without ns_info is
+        never handed back to a caller that actually requested it.
+        """
+        key = f"{domain}|NS|{with_ns_info}"
+
+        cached = self._ns_walk_cache.get(key)
+        if cached is not None:
+            values, ns_info, zone, servers, expires = cached
+            if expires >= time.time():
+                self.stats.cache_hits += 1
+                return values, ns_info, zone, servers
+            self._ns_walk_cache.pop(key, None)
+        self.stats.cache_misses += 1
+
+        existing = self._ns_walk_in_flight.get(key)
+        if existing is not None:
+            # See `resolve()` for why `asyncio.shield` is needed here: this
+            # future is shared by every coroutine currently walking the
+            # exact same NS chain, and our own cancellation must not
+            # propagate to them.
+            self.stats.dedup_hits += 1
+            return await asyncio.shield(existing)
+
+        loop = asyncio.get_event_loop()
+        future: "asyncio.Future[Tuple[List[str], List[Dict[str, str]], Optional[str], List[str]]]" = (
+            loop.create_future()
+        )
+        self._ns_walk_in_flight[key] = future
+        try:
+            result = await self._resolve_iterative(domain, "NS", with_ns_info=with_ns_info)
+        except Exception as exc:
+            if not future.done():
+                future.set_exception(exc)
+            raise
+        finally:
+            self._ns_walk_in_flight.pop(key, None)
+
+        values, ns_info, zone, servers = result
+        ttl = POSITIVE_CACHE_TTL if values or zone else NEGATIVE_CACHE_TTL
+        self._ns_walk_cache[key] = (values, ns_info, zone, servers, time.time() + ttl)
+        if not future.done():
+            future.set_result(result)
+        return result
+
     async def _ns_info(self, ns_names: List[str]) -> List[Dict[str, str]]:
         # Resolve every nameserver hostname's A and AAAA addresses
         # concurrently instead of one at a time.
@@ -687,8 +767,8 @@ class IterativeResolver:
             # the resulting authoritative servers for the A and AAAA queries
             # instead of repeating the whole referral chain for each record
             # type.
-            ns_values, ns_info, zone, servers = await self._resolve_iterative(
-                domain, "NS", with_ns_info=with_ns_info
+            ns_values, ns_info, zone, servers = await self._resolve_ns_walk(
+                domain, with_ns_info
             )
 
             # A and AAAA share the same authoritative servers, so fetch them

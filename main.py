@@ -120,6 +120,12 @@ async def resolve_domains(
                         timeout=PER_DOMAIN_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
+                    # `resolver.resolve_full` was cancelled by `wait_for`
+                    # before it could reach its own `finally` block (see
+                    # `ResolverStats.record_domain`), so this timeout would
+                    # otherwise go completely unaccounted for in the
+                    # resolver's stats. Record it here instead.
+                    resolver.stats.record_domain(PER_DOMAIN_TIMEOUT, timed_out=True)
                     result = {"hostname": domain, "error": f"timeout after {PER_DOMAIN_TIMEOUT}s"}
             except Exception as exc:  # keep going even if one domain fails
                 result = {"hostname": domain, "error": str(exc)}

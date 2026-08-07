@@ -47,7 +47,7 @@ jobs:
     # servers concurrently.
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 1
       matrix:
         list: ${{ fromJson(needs.compute_lists.outputs.lists) }}
     steps:

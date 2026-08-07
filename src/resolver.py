@@ -52,6 +52,18 @@ ROOT_SERVERS: List[str] = [
     "202.12.27.33",   # m.root-servers.net
 ]
 
+# Well-known public recursive resolver (Cloudflare), that can optionally be
+# queried directly instead of walking the delegation chain ourselves (root
+# -> TLD -> ... -> authoritative). This trades away the zone/delegation
+# info we'd otherwise collect (and the ability to spread queries across
+# many different authoritative servers) for a single, much cheaper round
+# trip per query -- handy in environments (e.g. CI runners sharing a
+# well-known IP range) where our own iterative queries get rate-limited by
+# authoritative servers. Used as the default value for
+# `IterativeResolver(recursive_server=...)` / the CLI's
+# `--recursive-resolver` flag.
+CLOUDFLARE_DNS = "1.1.1.1"
+
 MAX_REFERRALS = 20
 QUERY_TIMEOUT = 1.0
 QUERY_RETRIES = 3
@@ -283,7 +295,15 @@ class IterativeResolver:
     than by a thread pool.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, recursive_server: Optional[str] = None) -> None:
+        # When set, bypass the referral-walk entirely and simply query this
+        # single recursive resolver (e.g. Cloudflare's 1.1.1.1) directly for
+        # every name, letting it do the iterative work on our behalf. See
+        # `_resolve_via_recursive` for the actual query logic. Left as
+        # `None` by default to preserve the existing (self-performed
+        # iterative resolution) behavior.
+        self._recursive_server = recursive_server
+
         self.stats = ResolverStats()
         self.cache = MemoryCache(stats=self.stats)
 
@@ -490,6 +510,42 @@ class IterativeResolver:
                     values.append(rdata.to_text())
         return values, cname_target
 
+    async def _resolve_via_recursive(
+        self, qname: str, rdtype: str, with_ns_info: bool = False
+    ) -> Tuple[List[str], List[Dict[str, str]], Optional[str], List[str]]:
+        """Resolve `qname`/`rdtype` with a single query against
+        `self._recursive_server`, letting it do the iterative work on our
+        behalf, instead of walking the delegation chain ourselves.
+
+        This intentionally mirrors `_resolve_iterative`'s return shape
+        (answer_values, nameserver_info, zone, final_servers) so callers
+        don't need to know which strategy produced the result. The `zone`
+        we can report here is necessarily `None`: since we never see the
+        actual delegation chain, we have no way to determine which zone
+        was ultimately authoritative for the name (unlike the iterative
+        path, which observes every referral).
+        """
+        response = await self._send_query(self._recursive_server, qname, rdtype)
+        if response is None:
+            return [], [], None, [self._recursive_server]
+
+        values, cname_target = self._extract_answer(response, rdtype)
+        if not values and cname_target:
+            # Follow the CNAME chain, still going through the same
+            # recursive server (via `resolve()` / `_resolve_iterative`,
+            # which will delegate back here since `_recursive_server` is
+            # set on this instance).
+            values = await self.resolve(cname_target, rdtype)
+
+        # Nameserver info only makes sense (and is only requested) when
+        # resolving NS records themselves -- `values` are then the NS
+        # hostnames directly.
+        ns_info: List[Dict[str, str]] = []
+        if with_ns_info and rdtype == "NS" and values:
+            ns_info = await self._ns_info(values)
+
+        return values, ns_info, None, [self._recursive_server]
+
     async def _resolve_iterative(
         self, qname: str, rdtype: str, with_ns_info: bool = False
     ) -> Tuple[List[str], List[Dict[str, str]], Optional[str], List[str]]:
@@ -512,6 +568,15 @@ class IterativeResolver:
         building it requires resolving each nameserver hostname's address,
         which is a large amount of extra fan-out that most callers discard.
         """
+        if self._recursive_server is not None and rdtype != "NS":
+            # Bypass the referral-walk entirely for A/AAAA (and any other
+            # non-NS) lookups: just ask the configured recursive resolver
+            # directly. See `_resolve_via_recursive`. NS lookups are
+            # deliberately excluded here: we still need to walk the real
+            # delegation chain ourselves to discover each domain's
+            # authoritative nameservers (and the zone they belong to),
+            # which a single recursive-resolver query can't give us.
+            return await self._resolve_via_recursive(qname, rdtype, with_ns_info=with_ns_info)
 
         # Skip straight to the deepest known zone-cut instead of always
         # starting the walk at the 13 root servers: this is what turns an

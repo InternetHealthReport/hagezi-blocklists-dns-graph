@@ -70,7 +70,7 @@ jobs:
         run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
 
       - name: Resolve blocklist (${{ matrix.list }})
-        run: uv run main.py --date "${{ steps.date.outputs.date }}" --only ${{ matrix.list }}
+        run: uv run main.py --date "${{ steps.date.outputs.date }}" --only ${{ matrix.list }} --recursive-resolver
 
       - name: Upload results artifact
         uses: actions/upload-artifact@v4

@@ -91,7 +91,7 @@ def test_main_writes_one_json_file_per_list(tmp_path, monkeypatch):
     }
     monkeypatch.setattr(main_module, "fetch_all_lists", lambda: fake_lists)
     monkeypatch.setattr(main_module, "RESULTS_DIR", tmp_path / "results")
-    monkeypatch.setattr(main_module, "IterativeResolver", lambda: FakeResolver())
+    monkeypatch.setattr(main_module, "IterativeResolver", lambda **kwargs: FakeResolver())
 
     monkeypatch.setattr(sys, "argv", ["main.py", "--date", "2024-01-01"])
     main_module.main()
@@ -113,7 +113,7 @@ def test_main_respects_only_filter(tmp_path, monkeypatch):
     }
     monkeypatch.setattr(main_module, "fetch_all_lists", lambda: fake_lists)
     monkeypatch.setattr(main_module, "RESULTS_DIR", tmp_path / "results")
-    monkeypatch.setattr(main_module, "IterativeResolver", lambda: FakeResolver())
+    monkeypatch.setattr(main_module, "IterativeResolver", lambda **kwargs: FakeResolver())
 
     monkeypatch.setattr(sys, "argv", ["main.py", "--date", "2024-01-01", "--only", "list-one"])
     main_module.main()

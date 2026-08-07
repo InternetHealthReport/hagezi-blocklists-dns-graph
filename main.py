@@ -14,7 +14,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from src.fetch_lists import fetch_all_lists
-from src.resolver import IterativeResolver
+from src.resolver import CLOUDFLARE_DNS, IterativeResolver
 
 try:
     import resource
@@ -183,7 +183,7 @@ def _chunk(items: list[str], n: int) -> list[list[str]]:
 
 
 def _resolve_chunk_in_process(
-    domains: list[str], list_name: str, with_ns_info: bool
+    domains: list[str], list_name: str, with_ns_info: bool, recursive_server: str | None = None
 ) -> tuple[list[dict], str]:
     """Entry point run inside a worker *process* (via `ProcessPoolExecutor`):
     builds its own event loop and its own `IterativeResolver` (own cache/
@@ -204,7 +204,7 @@ def _resolve_chunk_in_process(
     if uvloop is not None:
         uvloop.install()
 
-    resolver = IterativeResolver()
+    resolver = IterativeResolver(recursive_server=recursive_server)
     records = asyncio.run(
         resolve_domains(resolver, domains, list_name=list_name, with_ns_info=with_ns_info)
     )
@@ -212,7 +212,11 @@ def _resolve_chunk_in_process(
 
 
 async def _resolve_list_multiprocess(
-    domains: list[str], list_name: str, with_ns_info: bool, workers: int
+    domains: list[str],
+    list_name: str,
+    with_ns_info: bool,
+    workers: int,
+    recursive_server: str | None = None,
 ) -> list[dict]:
     """Partition `domains` across `workers` processes and resolve each
     partition in parallel, then reassemble the results in original order.
@@ -223,7 +227,7 @@ async def _resolve_list_multiprocess(
     """
     chunks = _chunk(domains, workers)
     if len(chunks) <= 1:
-        resolver = IterativeResolver()
+        resolver = IterativeResolver(recursive_server=recursive_server)
         records = await resolve_domains(
             resolver, domains, list_name=list_name, with_ns_info=with_ns_info
         )
@@ -238,7 +242,12 @@ async def _resolve_list_multiprocess(
     with ProcessPoolExecutor(max_workers=len(chunks)) as pool:
         futures = [
             loop.run_in_executor(
-                pool, _resolve_chunk_in_process, chunk, f"{list_name}[{i}]", with_ns_info
+                pool,
+                _resolve_chunk_in_process,
+                chunk,
+                f"{list_name}[{i}]",
+                with_ns_info,
+                recursive_server,
             )
             for i, chunk in enumerate(chunks)
         ]
@@ -263,7 +272,11 @@ async def _run(args: argparse.Namespace) -> None:
     for name, domains in all_lists.items():
         print(f"Resolving {len(domains)} domains for list '{name}'...", file=sys.stderr)
         records = await _resolve_list_multiprocess(
-            domains, name, with_ns_info=True, workers=args.workers
+            domains,
+            name,
+            with_ns_info=True,
+            workers=args.workers,
+            recursive_server=args.recursive_resolver,
         )
 
         output = {
@@ -300,6 +313,22 @@ def main() -> None:
             "Number of worker processes used to resolve each list's domains "
             f"in parallel (default: {DEFAULT_WORKERS}, i.e. one per CPU core). "
             "Set to 1 to disable multiprocessing."
+        ),
+    )
+    parser.add_argument(
+        "--recursive-resolver",
+        dest="recursive_resolver",
+        nargs="?",
+        const=CLOUDFLARE_DNS,
+        default=None,
+        metavar="IP",
+        help=(
+            "Bypass our own iterative (root -> TLD -> authoritative) "
+            "resolution and instead query this recursive resolver IP "
+            "directly for every lookup (e.g. useful in CI environments "
+            "where iterative queries get rate-limited by authoritative "
+            f"servers). If given without a value, defaults to {CLOUDFLARE_DNS} "
+            "(Cloudflare). Disabled (own iterative resolution) by default."
         ),
     )
     args = parser.parse_args()

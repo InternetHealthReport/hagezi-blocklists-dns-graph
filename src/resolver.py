@@ -56,13 +56,23 @@ MAX_REFERRALS = 20
 QUERY_TIMEOUT = 3.0
 QUERY_RETRIES = 2
 
+# Base delay (seconds) used to compute randomized backoff between retry
+# attempts within `_send_query`. Retrying immediately after a timeout/error
+# means every in-flight domain resolution retries in lockstep, producing
+# the same bursty all-at-once traffic pattern that got rate-limited in the
+# first place. Adding a small random jitter delay before each retry spreads
+# retries out over time instead, which is much friendlier to any
+# server-side (or CI-egress-side) rate limiting.
+RETRY_BASE_DELAY = 0.1
+RETRY_MAX_DELAY = 1.0
+
 # How many servers to race concurrently for a single query. Rather than
 # querying servers one at a time and retrying each before moving to the
 # next (which can burn several times QUERY_TIMEOUT on a single slow/dead
 # server), we fire queries at several candidate servers at once and take
 # whichever answers first, cancelling the rest. This trades a small amount
 # of extra query volume for a much lower worst-case latency per domain.
-MAX_RACE = 3
+MAX_RACE = 5
 
 # Default TTL for positive answers held in the in-memory cache.
 POSITIVE_CACHE_TTL = 3600
@@ -333,7 +343,18 @@ class IterativeResolver:
     async def _send_query(self, server_ip: str, qname: str, rdtype: str) -> Optional[dns.message.Message]:
         q = dns.message.make_query(qname, rdtype, want_dnssec=False)
         last_outcome = "error"
-        for _attempt in range(QUERY_RETRIES):
+        for attempt in range(QUERY_RETRIES):
+            if attempt > 0:
+                # Jittered backoff before each retry: retrying immediately
+                # after a timeout/error means every in-flight domain
+                # resolution retries in lockstep, producing the same
+                # bursty all-at-once traffic pattern that likely got
+                # rate-limited in the first place (see RETRY_BASE_DELAY
+                # above). Exponential-ish growth (scaled by attempt number)
+                # capped at RETRY_MAX_DELAY, with full jitter so concurrent
+                # retries don't line back up with each other.
+                delay = min(RETRY_MAX_DELAY, RETRY_BASE_DELAY * (2 ** (attempt - 1)))
+                await asyncio.sleep(random.uniform(0, delay))
             start = time.monotonic()
             try:
                 response = await dns.asyncquery.udp(q, server_ip, timeout=QUERY_TIMEOUT)

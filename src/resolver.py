@@ -53,8 +53,8 @@ ROOT_SERVERS: List[str] = [
 ]
 
 MAX_REFERRALS = 20
-QUERY_TIMEOUT = 3.0
-QUERY_RETRIES = 2
+QUERY_TIMEOUT = 1.0
+QUERY_RETRIES = 3
 
 # Base delay (seconds) used to compute randomized backoff between retry
 # attempts within `_send_query`. Retrying immediately after a timeout/error

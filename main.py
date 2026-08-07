@@ -50,7 +50,7 @@ RESULTS_DIR = Path("results")
 # MAX_CONCURRENCY. This must stay comfortably under the process's open-file
 # limit (see `_raise_fd_limit` below), or queries will silently fail with
 # OSError ("too many open files") and get cached as negative results.
-MAX_CONCURRENCY = 16
+MAX_CONCURRENCY = 64
 
 # Rough upper bound on file descriptors a single in-flight resolution can
 # use at once (MAX_RACE candidate sockets x up to 3 concurrent query types).

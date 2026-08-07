@@ -10,12 +10,10 @@ permissions:
   contents: write
 
 jobs:
-  resolve:
+  compute_lists:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0, 1, 2, 3]
+    outputs:
+      lists: ${{ steps.lists.outputs.lists }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -31,38 +29,27 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
-      - name: Compute run date
-        id: date
-        run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
-
-      - name: Compute lists for this shard
+      - name: Compute list names as JSON array
         id: lists
         run: |
-          uv run python - <<'PY'
+          uv run python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
           from src.fetch_lists import BLOCKLISTS
           names = sorted(BLOCKLISTS)
-          # Exclude very long lists that will run on dedicated self-hosted runners
-          exclude = {'nrd-dga', 'threat-med'}
-          names = [n for n in names if n not in exclude]
-          shard = int("${{ matrix.shard }}")
-          total_shards = 4
-          selected = [n for i, n in enumerate(names) if i % total_shards == shard]
-          print('lists=' + ' '.join(selected))
+          print("lists=" + json.dumps(names))
           PY
-          >> "$GITHUB_OUTPUT"
 
-      - name: Resolve blocklists (shard ${{ matrix.shard }})
-        run: uv run main.py --date "${{ steps.date.outputs.date }}" --only ${{ steps.lists.outputs.lists }}
-
-      - name: Upload results artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: results-shard-${{ matrix.shard }}
-          path: results/${{ steps.date.outputs.date }}
-
-  nrd_dga:
-    # Run on a dedicated runner
+  resolve:
+    needs: compute_lists
     runs-on: ubuntu-latest
+    # Run one runner per blocklist, but execute them sequentially (one at a
+    # time) rather than in parallel, to avoid many runners hammering DNS
+    # servers concurrently.
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        list: ${{ fromJson(needs.compute_lists.outputs.lists) }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -82,48 +69,17 @@ jobs:
         id: date
         run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve nrd-dga list
-        run: uv run main.py --date "${{ steps.date.outputs.date }}" --only nrd-dga
+      - name: Resolve blocklist (${{ matrix.list }})
+        run: uv run main.py --date "${{ steps.date.outputs.date }}" --only ${{ matrix.list }}
 
       - name: Upload results artifact
         uses: actions/upload-artifact@v4
         with:
-          name: results-nrd-dga
-          path: results/${{ steps.date.outputs.date }}
-
-  threat_med:
-    # Run on a dedicated runner
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v3
-        with:
-          enable-cache: true
-
-      - name: Set up Python
-        run: uv python install
-
-      - name: Install dependencies
-        run: uv sync
-
-      - name: Compute run date
-        id: date
-        run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
-
-      - name: Resolve threat-med list
-        run: uv run main.py --date "${{ steps.date.outputs.date }}" --only threat-med
-
-      - name: Upload results artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: results-threat-med
+          name: results-${{ matrix.list }}
           path: results/${{ steps.date.outputs.date }}
 
   commit:
-    needs: [resolve, nrd_dga, threat_med]
+    needs: resolve
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

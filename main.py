@@ -102,7 +102,7 @@ def _raise_fd_limit(min_needed: int) -> None:
 # How often the progress bar is redrawn, in completed domains. Rendering on
 # every single completion means a formatted, flushed stderr write per domain
 # from a loop fed by thousands of worker threads, which is pure overhead.
-PROGRESS_EVERY = 100
+PROGRESS_EVERY = 1000
 
 
 def _print_progress(prefix: str, done: int, total: int, bar_width: int = 40) -> None:

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import functools
 import random
 import time
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
@@ -393,24 +394,35 @@ class IterativeResolver:
 
     # -- zone-cut cache ---------------------------------------------------
     @staticmethod
-    def _suffixes(qname: str) -> List[str]:
+    @functools.lru_cache(maxsize=65536)
+    def _suffixes(qname: str) -> Tuple[str, ...]:
         """Return the ancestor zone names of `qname`, longest first.
 
         e.g. "a.b.example.com." -> ["a.b.example.com.", "b.example.com.",
         "example.com.", "com."]. Used to probe the zone-cut cache with a
         handful of direct dict lookups instead of scanning every known zone.
+
+        This is a pure function of `qname` (it never touches any resolver
+        state) and is called at least once per query attempt -- including
+        every referral hop and every glueless NS lookup -- so across a
+        million-domain run it ends up being invoked many millions of times.
+        Parsing/serializing `dns.name.Name` objects on every single call
+        was showing up as measurable CPU overhead; since blocklists share
+        huge numbers of common suffixes (most domains share a TLD, many
+        share a whole parent zone), an `lru_cache` turns most of those
+        calls into a dict lookup instead of repeated DNS-name parsing.
         """
         try:
             name = dns.name.from_text(qname)
         except dns.exception.DNSException:
-            return []
+            return ()
         labels = name.labels
         # Keep the trailing root label so the generated names are absolute
         # ("com." rather than "com") and match the zone-cache keys, which
         # come straight from the wire format.
-        return [
+        return tuple(
             dns.name.Name(labels[i:]).to_text() for i in range(len(labels) - 1)
-        ]
+        )
 
     def _best_cached_zone(self, qname: str) -> Optional[Tuple[str, List[str]]]:
         """Return (zone, server_ips) for the longest cached zone that is an

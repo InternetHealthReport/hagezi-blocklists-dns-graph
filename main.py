@@ -7,7 +7,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -19,13 +21,28 @@ try:
 except ImportError:  # pragma: no cover - resource is POSIX-only
     resource = None
 
+# Use uvloop's C-based event loop instead of the stdlib asyncio one when it
+# is available: for a workload that is almost entirely "schedule tens of
+# thousands of tiny coroutines and wake them up on socket I/O" (exactly what
+# this resolver does), uvloop's scheduling/callback overhead is measurably
+# lower than the pure-Python default loop, which directly reduces CPU time
+# spent outside of actual DNS I/O. This is a no-op (falls back silently) on
+# platforms where uvloop isn't installed/available (e.g. Windows).
+try:
+    import uvloop
+
+    uvloop.install()
+except ImportError:  # pragma: no cover - optional dependency
+    uvloop = None
+
 RESULTS_DIR = Path("results")
 
-# Maximum number of domains being resolved concurrently. Since resolution is
-# now fully asyncio-based (no blocking sockets, no per-domain OS thread),
-# this can safely be much higher than a thread pool's practical size -- the
-# real limits are the remote name servers' tolerance for concurrent queries
-# and local file-descriptor/ephemeral-port limits, not thread overhead.
+# Maximum number of domains being resolved concurrently *within a single
+# worker process*. Since resolution is fully asyncio-based (no blocking
+# sockets, no per-domain OS thread), this can safely be much higher than a
+# thread pool's practical size -- the real limits are the remote name
+# servers' tolerance for concurrent queries and local file-descriptor/
+# ephemeral-port limits, not thread overhead.
 #
 # NOTE: each in-flight domain resolution can hold open several UDP sockets
 # at once (racing up to MAX_RACE servers, for NS + A + AAAA queries), so the
@@ -33,7 +50,7 @@ RESULTS_DIR = Path("results")
 # MAX_CONCURRENCY. This must stay comfortably under the process's open-file
 # limit (see `_raise_fd_limit` below), or queries will silently fail with
 # OSError ("too many open files") and get cached as negative results.
-MAX_CONCURRENCY = 256
+MAX_CONCURRENCY = 100
 
 # Rough upper bound on file descriptors a single in-flight resolution can
 # use at once (MAX_RACE candidate sockets x up to 3 concurrent query types).
@@ -41,6 +58,20 @@ FDS_PER_DOMAIN = 10
 
 # Per-domain resolution timeout in seconds. Guards against hangs in resolver.
 PER_DOMAIN_TIMEOUT = 10
+
+# Default number of worker *processes* used to resolve a single list.
+#
+# asyncio (and therefore the whole resolver) is single-threaded: no matter
+# how many thousands of domains are "concurrently" in flight, all of the
+# actual Python bytecode -- DNS wire-format parsing/building, cache
+# bookkeeping, etc. -- runs on one CPU core, serialized by the GIL. Once DNS
+# I/O is no longer the bottleneck (e.g. most answers come from nearby/fast
+# resolvers or from the zone cache), that per-query CPU work becomes the
+# limiting factor, and the only way to use more than one core for it is
+# real OS processes. Each worker process gets its own event loop and its
+# own `IterativeResolver` (so its own cache/zone-cache), and a list's
+# domains are simply partitioned across them.
+DEFAULT_WORKERS = os.cpu_count() or 1
 
 
 def _raise_fd_limit(min_needed: int) -> None:
@@ -140,6 +171,86 @@ async def resolve_domains(
     return [records[d] for d in domains if d in records]
 
 
+def _chunk(items: list[str], n: int) -> list[list[str]]:
+    """Split `items` into at most `n` contiguous, roughly equal chunks,
+    dropping any empty chunks (e.g. when there are fewer domains than
+    workers)."""
+    if n <= 1 or len(items) <= 1:
+        return [items] if items else []
+    size = -(-len(items) // n)  # ceil division
+    chunks = [items[i : i + size] for i in range(0, len(items), size)]
+    return [c for c in chunks if c]
+
+
+def _resolve_chunk_in_process(
+    domains: list[str], list_name: str, with_ns_info: bool
+) -> tuple[list[dict], str]:
+    """Entry point run inside a worker *process* (via `ProcessPoolExecutor`):
+    builds its own event loop and its own `IterativeResolver` (own cache/
+    zone-cache) and resolves its share of `domains`.
+
+    This -- and not just more asyncio concurrency -- is what lets the
+    resolver actually use more than one CPU core: asyncio is single-threaded,
+    so once queries are I/O-bound rather than CPU-bound, no amount of extra
+    concurrency within one process buys more throughput once a single core
+    is saturated with DNS-message parsing/building and cache bookkeeping.
+
+    Returns `(records, stats_report)` so the parent process can merge
+    results back in original order and print each worker's stats.
+    """
+    # Each process needs its own uvloop install (module-level state doesn't
+    # cross the fork/spawn boundary in a way we can rely on for spawn-start
+    # workers), so re-apply it here too.
+    if uvloop is not None:
+        uvloop.install()
+
+    resolver = IterativeResolver()
+    records = asyncio.run(
+        resolve_domains(resolver, domains, list_name=list_name, with_ns_info=with_ns_info)
+    )
+    return records, resolver.stats.report()
+
+
+async def _resolve_list_multiprocess(
+    domains: list[str], list_name: str, with_ns_info: bool, workers: int
+) -> list[dict]:
+    """Partition `domains` across `workers` processes and resolve each
+    partition in parallel, then reassemble the results in original order.
+
+    Falls back to plain in-process (single-core) resolution when there
+    are too few domains, or only one worker, to make process-spawning
+    overhead worthwhile.
+    """
+    chunks = _chunk(domains, workers)
+    if len(chunks) <= 1:
+        resolver = IterativeResolver()
+        records = await resolve_domains(
+            resolver, domains, list_name=list_name, with_ns_info=with_ns_info
+        )
+        print(resolver.stats.report(), file=sys.stderr)
+        return records
+
+    print(
+        f"  {list_name}: splitting {len(domains)} domains across {len(chunks)} worker processes",
+        file=sys.stderr,
+    )
+    loop = asyncio.get_event_loop()
+    with ProcessPoolExecutor(max_workers=len(chunks)) as pool:
+        futures = [
+            loop.run_in_executor(
+                pool, _resolve_chunk_in_process, chunk, f"{list_name}[{i}]", with_ns_info
+            )
+            for i, chunk in enumerate(chunks)
+        ]
+        chunk_results = await asyncio.gather(*futures)
+
+    records: list[dict] = []
+    for i, (chunk_records, stats_report) in enumerate(chunk_results):
+        records.extend(chunk_records)
+        print(f"  {list_name}[{i}] done:\n{stats_report}", file=sys.stderr)
+    return records
+
+
 async def _run(args: argparse.Namespace) -> None:
     output_dir = RESULTS_DIR / args.date
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -149,11 +260,11 @@ async def _run(args: argparse.Namespace) -> None:
     if args.only:
         all_lists = {k: v for k, v in all_lists.items() if k in args.only}
 
-    resolver = IterativeResolver()
-
     for name, domains in all_lists.items():
         print(f"Resolving {len(domains)} domains for list '{name}'...", file=sys.stderr)
-        records = await resolve_domains(resolver, domains, list_name=name, with_ns_info=True)
+        records = await _resolve_list_multiprocess(
+            domains, name, with_ns_info=True, workers=args.workers
+        )
 
         output = {
             "list": name,
@@ -165,7 +276,6 @@ async def _run(args: argparse.Namespace) -> None:
         out_path.write_text(json.dumps(output, indent=2))
         print(f"Wrote {out_path}", file=sys.stderr)
 
-    print(resolver.stats.report(), file=sys.stderr)
     print("Done.", file=sys.stderr)
 
 
@@ -181,6 +291,16 @@ def main() -> None:
         nargs="*",
         default=None,
         help="Only process these list names (default: all).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=(
+            "Number of worker processes used to resolve each list's domains "
+            f"in parallel (default: {DEFAULT_WORKERS}, i.e. one per CPU core). "
+            "Set to 1 to disable multiprocessing."
+        ),
     )
     args = parser.parse_args()
     _raise_fd_limit(MAX_CONCURRENCY * FDS_PER_DOMAIN)

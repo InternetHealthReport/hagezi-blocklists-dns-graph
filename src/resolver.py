@@ -65,7 +65,7 @@ ROOT_SERVERS: List[str] = [
 CLOUDFLARE_DNS = "1.1.1.1"
 
 MAX_REFERRALS = 20
-QUERY_TIMEOUT = 3.0
+QUERY_TIMEOUT = 1.0
 QUERY_RETRIES = 3
 
 # Base delay (seconds) used to compute randomized backoff between retry
@@ -84,7 +84,7 @@ RETRY_MAX_DELAY = 1.0
 # server), we fire queries at several candidate servers at once and take
 # whichever answers first, cancelling the rest. This trades a small amount
 # of extra query volume for a much lower worst-case latency per domain.
-MAX_RACE = 3
+MAX_RACE = 2
 
 # Default TTL for positive answers held in the in-memory cache.
 POSITIVE_CACHE_TTL = 3600

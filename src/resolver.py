@@ -65,7 +65,7 @@ ROOT_SERVERS: List[str] = [
 CLOUDFLARE_DNS = "1.1.1.1"
 
 MAX_REFERRALS = 20
-QUERY_TIMEOUT = 1.0
+QUERY_TIMEOUT = 3.0
 QUERY_RETRIES = 3
 
 # Base delay (seconds) used to compute randomized backoff between retry
@@ -84,7 +84,7 @@ RETRY_MAX_DELAY = 1.0
 # server), we fire queries at several candidate servers at once and take
 # whichever answers first, cancelling the rest. This trades a small amount
 # of extra query volume for a much lower worst-case latency per domain.
-MAX_RACE = 2
+MAX_RACE = 5
 
 # Default TTL for positive answers held in the in-memory cache.
 POSITIVE_CACHE_TTL = 3600
@@ -360,8 +360,7 @@ class IterativeResolver:
         ] = {}
 
     # -- low level -----------------------------------------------------
-    async def _send_query(self, server_ip: str, qname: str, rdtype: str) -> Optional[dns.message.Message]:
-        q = dns.message.make_query(qname, rdtype, want_dnssec=False)
+    async def _send_query(self, server_ip: str, query: dns.message.QueryMessage) -> Optional[dns.message.Message]:
         last_outcome = "error"
         for attempt in range(QUERY_RETRIES):
             if attempt > 0:
@@ -409,7 +408,8 @@ class IterativeResolver:
             return None
 
         candidates = servers[:MAX_RACE]
-        tasks = [asyncio.ensure_future(self._send_query(ip, qname, rdtype)) for ip in candidates]
+        query = dns.message.make_query(qname, rdtype, want_dnssec=False)
+        tasks = [asyncio.ensure_future(self._send_query(ip, query)) for ip in candidates]
         remaining_servers = servers[MAX_RACE:]
 
         try:
@@ -424,7 +424,8 @@ class IterativeResolver:
             # one at a time (rare path -- most zones have <= MAX_RACE
             # useful servers anyway).
             for ip in remaining_servers:
-                result = await self._send_query(ip, qname, rdtype)
+                query = dns.message.make_query(qname, rdtype, want_dnssec=False)
+                result = await self._send_query(ip, query)
                 if result is not None:
                     return result
             return None
@@ -525,7 +526,8 @@ class IterativeResolver:
         was ultimately authoritative for the name (unlike the iterative
         path, which observes every referral).
         """
-        response = await self._send_query(self._recursive_server, qname, rdtype)
+        query = dns.message.make_query(qname, rdtype, want_dnssec=False)
+        response = await self._send_query(self._recursive_server, query)
         if response is None:
             return [], [], None, [self._recursive_server]
 

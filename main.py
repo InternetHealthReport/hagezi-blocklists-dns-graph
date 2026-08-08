@@ -1,11 +1,13 @@
 """Fetch Hagezi blocklists, resolve every domain (iteratively, with caching),
-and write one JSON result file per list under results/<date>/<list>.json.
+and write one gzip-compressed JSON result file per list under
+results/<date>/<list>.json.gz.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import gzip
 import json
 import os
 import sys
@@ -285,8 +287,12 @@ async def _run(args: argparse.Namespace) -> None:
             "domain_count": len(domains),
             "records": records,
         }
-        out_path = output_dir / f"{name}.json"
-        out_path.write_text(json.dumps(output, indent=2))
+        out_path = output_dir / f"{name}.json.gz"
+        payload = json.dumps(output, separators=(",", ":")).encode("utf-8")
+        with open(out_path, "wb") as raw, gzip.GzipFile(
+            fileobj=raw, mode="wb", mtime=0
+        ) as f:
+            f.write(payload)
         print(f"Wrote {out_path}", file=sys.stderr)
 
     print("Done.", file=sys.stderr)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import sys
 from pathlib import Path
@@ -97,10 +98,11 @@ def test_main_writes_one_json_file_per_list(tmp_path, monkeypatch):
     main_module.main()
 
     out_dir = tmp_path / "results" / "2024-01-01"
-    assert (out_dir / "list-one.json").exists()
-    assert (out_dir / "list-two.json").exists()
+    assert (out_dir / "list-one.json.gz").exists()
+    assert (out_dir / "list-two.json.gz").exists()
 
-    data = json.loads((out_dir / "list-one.json").read_text())
+    with gzip.open(out_dir / "list-one.json.gz", "rt") as f:
+        data = json.load(f)
     assert data["list"] == "list-one"
     assert data["domain_count"] == 2
     assert len(data["records"]) == 2
@@ -119,6 +121,6 @@ def test_main_respects_only_filter(tmp_path, monkeypatch):
     main_module.main()
 
     out_dir = tmp_path / "results" / "2024-01-01"
-    assert (out_dir / "list-one.json").exists()
-    assert not (out_dir / "list-two.json").exists()
+    assert (out_dir / "list-one.json.gz").exists()
+    assert not (out_dir / "list-two.json.gz").exists()
 

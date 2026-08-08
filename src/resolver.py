@@ -376,9 +376,9 @@ class IterativeResolver:
                 await asyncio.sleep(random.uniform(0, delay))
             start = time.monotonic()
             try:
-                response = await dns.asyncquery.udp(q, server_ip, timeout=QUERY_TIMEOUT)
+                response = await dns.asyncquery.udp(query, server_ip, timeout=QUERY_TIMEOUT)
                 if response.flags & dns.flags.TC:
-                    response = await dns.asyncquery.tcp(q, server_ip, timeout=QUERY_TIMEOUT)
+                    response = await dns.asyncquery.tcp(query, server_ip, timeout=QUERY_TIMEOUT)
                 self.stats.record_query(time.monotonic() - start, "answered")
                 return response
             except dns.exception.Timeout:

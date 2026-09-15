@@ -1,9 +1,9 @@
-# hagezi-blocklists-intel
+# hagezi-blocklists-dns-graph
 
 Fetches the [Hagezi](https://github.com/hagezi/dns-blocklists) DNS
 blocklists, resolves every listed domain, and stores the results
 (A/AAAA records, authoritative name servers and their IPs) as JSON,
-one file per list, per day.
+one file per list, per scan. Currently set to fetch data once per week.
 
 ## How it works
 
@@ -57,7 +57,5 @@ Each `results/<date>/<list>.json` file looks like:
 
 ## Automation
 
-A GitHub Actions workflow (`.github/workflows/daily.yml`) runs the whole
-pipeline every day at 03:00 UTC and commits the new `results/<date>/`
-directory back to the repository, keeping every day's results separate.
+We are collecting data once a week (sunday at 10:00 UTC) and push new results here.
 

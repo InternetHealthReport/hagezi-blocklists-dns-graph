@@ -271,8 +271,14 @@ async def _run(args: argparse.Namespace) -> None:
     if args.only:
         all_lists = {k: v for k, v in all_lists.items() if k in args.only}
 
-    for name, domains in all_lists.items():
-        print(f"Resolving {len(domains)} domains for list '{name}'...", file=sys.stderr)
+    for name, blocklist in all_lists.items():
+        domains = blocklist.domains
+        commit = blocklist.commit
+        print(
+            f"Resolving {len(domains)} domains for list '{name}' "
+            f"({blocklist.repo}@{commit.hash if commit else blocklist.ref})...",
+            file=sys.stderr,
+        )
         records = await _resolve_list_multiprocess(
             domains,
             name,
@@ -284,6 +290,19 @@ async def _run(args: argparse.Namespace) -> None:
         output = {
             "list": name,
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            # Exact upstream revision the domains came from. Hagezi
+            # regenerates its lists daily, so recording the commit (hash +
+            # date) and the URL the data was downloaded from is the only
+            # way to find the original input back afterwards. `commit` and
+            # `commit_date` are null when the revision could not be
+            # resolved, in which case `url` points at a moving reference.
+            "source": {
+                "repo": blocklist.repo,
+                "ref": blocklist.ref,
+                "commit": commit.hash if commit else None,
+                "commit_date": commit.date if commit else None,
+                "url": blocklist.url,
+            },
             "domain_count": len(domains),
             "records": records,
         }

@@ -13,7 +13,23 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import main as main_module
+from src.fetch_lists import Blocklist, Commit
 from src.resolver import IterativeResolver
+
+COMMIT = Commit("c30a9937e79f18bb31dcf4d45ac4988c3ddc8e7a", "2024-05-01T03:00:00Z")
+
+
+def _blocklist(name: str, domains: list[str], commit: Commit | None = COMMIT) -> Blocklist:
+    """Build a fetched-blocklist stand-in, as `fetch_all_lists` returns."""
+    ref = commit.hash if commit else "latest"
+    return Blocklist(
+        name=name,
+        domains=domains,
+        repo="hagezi/dns-blocklists",
+        ref="latest",
+        commit=commit,
+        url=f"https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@{ref}/wildcard/{name}.txt",
+    )
 
 
 class FakeResolver:
@@ -87,14 +103,16 @@ def test_resolve_domains_continues_on_error(monkeypatch):
 
 def test_main_writes_one_json_file_per_list(tmp_path, monkeypatch):
     fake_lists = {
-        "list-one": ["a.com", "b.com"],
-        "list-two": ["c.com"],
+        "list-one": _blocklist("list-one", ["a.com", "b.com"]),
+        "list-two": _blocklist("list-two", ["c.com"]),
     }
     monkeypatch.setattr(main_module, "fetch_all_lists", lambda: fake_lists)
     monkeypatch.setattr(main_module, "RESULTS_DIR", tmp_path / "results")
     monkeypatch.setattr(main_module, "IterativeResolver", lambda **kwargs: FakeResolver())
 
-    monkeypatch.setattr(sys, "argv", ["main.py", "--date", "2024-01-01"])
+    monkeypatch.setattr(
+        sys, "argv", ["main.py", "--date", "2024-01-01", "--workers", "1"]
+    )
     main_module.main()
 
     out_dir = tmp_path / "results" / "2024-01-01"
@@ -108,16 +126,63 @@ def test_main_writes_one_json_file_per_list(tmp_path, monkeypatch):
     assert len(data["records"]) == 2
 
 
+def test_main_records_the_upstream_commit_the_domains_came_from(tmp_path, monkeypatch):
+    """Hagezi rebuilds its lists daily, so each result file must point back
+    at the exact revision (hash + date) it was built from."""
+    fake_lists = {"list-one": _blocklist("list-one", ["a.com"])}
+    monkeypatch.setattr(main_module, "fetch_all_lists", lambda: fake_lists)
+    monkeypatch.setattr(main_module, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr(main_module, "IterativeResolver", lambda **kwargs: FakeResolver())
+
+    monkeypatch.setattr(
+        sys, "argv", ["main.py", "--date", "2024-01-01", "--workers", "1"]
+    )
+    main_module.main()
+
+    with gzip.open(tmp_path / "results" / "2024-01-01" / "list-one.json.gz", "rt") as f:
+        source = json.load(f)["source"]
+
+    assert source["repo"] == "hagezi/dns-blocklists"
+    assert source["commit"] == COMMIT.hash
+    assert source["commit_date"] == COMMIT.date
+    assert COMMIT.hash in source["url"]
+
+
+def test_main_records_a_null_commit_when_the_revision_is_unknown(tmp_path, monkeypatch):
+    """A failed revision lookup must leave the metadata empty rather than
+    claim a revision we can't vouch for."""
+    fake_lists = {"list-one": _blocklist("list-one", ["a.com"], commit=None)}
+    monkeypatch.setattr(main_module, "fetch_all_lists", lambda: fake_lists)
+    monkeypatch.setattr(main_module, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr(main_module, "IterativeResolver", lambda **kwargs: FakeResolver())
+
+    monkeypatch.setattr(
+        sys, "argv", ["main.py", "--date", "2024-01-01", "--workers", "1"]
+    )
+    main_module.main()
+
+    with gzip.open(tmp_path / "results" / "2024-01-01" / "list-one.json.gz", "rt") as f:
+        source = json.load(f)["source"]
+
+    assert source["commit"] is None
+    assert source["commit_date"] is None
+    assert source["ref"] == "latest"
+
+
 def test_main_respects_only_filter(tmp_path, monkeypatch):
     fake_lists = {
-        "list-one": ["a.com"],
-        "list-two": ["b.com"],
+        "list-one": _blocklist("list-one", ["a.com"]),
+        "list-two": _blocklist("list-two", ["b.com"]),
     }
     monkeypatch.setattr(main_module, "fetch_all_lists", lambda: fake_lists)
     monkeypatch.setattr(main_module, "RESULTS_DIR", tmp_path / "results")
     monkeypatch.setattr(main_module, "IterativeResolver", lambda **kwargs: FakeResolver())
 
-    monkeypatch.setattr(sys, "argv", ["main.py", "--date", "2024-01-01", "--only", "list-one"])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["main.py", "--date", "2024-01-01", "--workers", "1", "--only", "list-one"],
+    )
     main_module.main()
 
     out_dir = tmp_path / "results" / "2024-01-01"
